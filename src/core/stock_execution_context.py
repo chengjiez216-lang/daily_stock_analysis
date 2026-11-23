@@ -77,7 +77,23 @@ class StockCancellationToken:
             worker.start()
             self._workers.append((worker, abandonment))
 
-    def join_workers(self, *, include_abandoned: bool = True) -> None:
+    def join_workers(
+        self, *, include_abandoned: bool = True, timeout: Optional[float] = 30.0
+    ) -> None:
+        """Join tracked workers, bounding the wait for abandoned ones.
+
+        A stock whose analysis timed out keeps its execution slot until its
+        workers exit. A worker hung in a blocking call (e.g. a stalled LLM
+        stream with no socket timeout) would otherwise hold the slot forever
+        and stall the whole batch. Bound the wait for abandoned workers so
+        the slot is always released; the hung daemon thread drains on its
+        own. Workers of a stock that finished on time are joined without
+        a bound, preserving the previous behaviour for that path.
+        """
+        effective_timeout = timeout if include_abandoned else None
+        deadline = (
+            None if effective_timeout is None else time.monotonic() + effective_timeout
+        )
         index = 0
         while True:
             with self._workers_lock:
@@ -85,7 +101,13 @@ class StockCancellationToken:
                     return
                 worker, abandonment = self._workers[index]
             if include_abandoned or not any(event.is_set() for event in abandonment):
-                worker.join()
+                if deadline is None:
+                    worker.join()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    worker.join(timeout=remaining)
             index += 1
 
 
