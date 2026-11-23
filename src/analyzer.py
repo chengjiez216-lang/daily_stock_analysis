@@ -3945,7 +3945,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             or 8192
         )
         requested_temperature = generation_config.get('temperature', 0.7)
-        requested_timeout = generation_config.get("timeout")
+        requested_timeout = generation_config.get("timeout") or getattr(
+                config, "generation_backend_timeout_seconds", None
+        )
 
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
