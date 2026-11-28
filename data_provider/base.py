@@ -150,6 +150,10 @@ def normalize_stock_code(stock_code: str) -> str:
     # while preserving explicit Yahoo suffix forms for JP/KR/TW.
     if '.' in code:
         base, suffix = code.rsplit('.', 1)
+        if suffix.upper() == 'AX':
+            if not is_suffix_market_symbol(code, "au"):
+                raise ValueError(f"Invalid ASX Yahoo symbol: {code!r}")
+            return code.upper()
         if suffix.upper() == 'T' and base.isdigit() and len(base) in (4, 5):
             return f"{base}.{suffix.upper()}"
         if suffix.upper() in ('KS', 'KQ') and base.isdigit() and len(base) == 6:
@@ -258,6 +262,8 @@ def _is_meaningful_chip_distribution(chip: Any) -> bool:
 
 def _market_tag(code: str) -> str:
     """返回市场标签: cn/us/hk/jp/kr/tw."""
+    if is_suffix_market_symbol(code, "au"):
+        return "au"
     if _is_us_market(code):
         return "us"
     if _is_hk_market(code):
@@ -664,9 +670,9 @@ class DataFetcherManager:
         "MiaoxiangFetcher": set(),
         "PytdxFetcher": {"cn"},
         "BaostockFetcher": {"cn"},
-        "YfinanceFetcher": {"cn", "hk", "us", "jp", "kr", "tw"},
+        "YfinanceFetcher": {"cn", "hk", "us", "jp", "kr", "tw", "au"},
         "LongbridgeFetcher": {"hk", "us"},
-        "FutuFetcher": {"hk"},
+        "FutuFetcher": {"hk", "cn", "us"},
         "FinnhubFetcher": {"us"},
         "AlphaVantageFetcher": {"us"},
     }
@@ -840,7 +846,7 @@ class DataFetcherManager:
         skipped: List[str] = []
         for fetcher in fetchers:
             supported = cls._DAILY_MARKET_FETCHER_SUPPORT.get(fetcher.name)
-            if supported is not None and market not in supported:
+            if (market == "au" and supported is None) or (supported is not None and market not in supported):
                 skipped.append(fetcher.name)
             else:
                 kept.append(fetcher)
@@ -2046,7 +2052,7 @@ class DataFetcherManager:
         is_jp = (not is_us) and (not is_hk) and _is_jp_market(stock_code)
         is_kr = (not is_us) and (not is_hk) and _is_kr_market(stock_code)
         is_tw = (not is_us) and (not is_hk) and _is_tw_market(stock_code)
-        market = "us" if is_us else "hk" if is_hk else "jp" if is_jp else "kr" if is_kr else "tw" if is_tw else "cn"
+        market = _market_tag(stock_code)
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
@@ -2073,6 +2079,11 @@ class DataFetcherManager:
                 source_order = ["LongbridgeFetcher", "FinnhubFetcher", "AlphaVantageFetcher", "YfinanceFetcher"]
             else:
                 source_order = ["FinnhubFetcher", "AlphaVantageFetcher", "YfinanceFetcher", "LongbridgeFetcher"]
+            # Futu(OpenD) 只在已配置 endpoint 时进入美股日 K 链路，且不占用锚定首位：
+            # 它的位置由 FUTU_PRIORITY(默认 2) 与其它源的数值优先级共同决定，
+            # 未配置 OpenD 的存量用户(如仅 Longbridge+YFinance)链路完全不变。
+            if not is_us_index and self._futu_realtime_enabled():
+                source_order.append("FutuFetcher")
             # 消费各数据源当前优先级(含 *_PRIORITY 环境变量):默认优先级与内置链路一致,
             # 单项调整(如 YFINANCE_PRIORITY=0)即时生效;指数/Longbridge preferred 的锚定首选不被普通优先级覆盖
             pin_first = bool(is_us_index or prefer_lb)
@@ -2476,6 +2487,16 @@ class DataFetcherManager:
         }
         return mapping.get(fetcher_name, fetcher_name.replace("Fetcher", "").lower())
 
+    @staticmethod
+    def _futu_realtime_enabled() -> bool:
+        """True when Futu OpenD is configured (and importable)."""
+        try:
+            from data_provider.futu_fetcher import FutuFetcher
+
+            return bool(FutuFetcher.has_configured_endpoint())
+        except Exception:  # noqa: BLE001 - fail closed: treat futu as disabled
+            return False
+
     def _enrich_realtime_quote(
         self,
         quote,
@@ -2570,8 +2591,9 @@ class DataFetcherManager:
         is_kr = (not is_us) and (not is_hk) and _is_kr_market(stock_code)
         is_tw = (not is_us) and (not is_hk) and _is_tw_market(stock_code)
 
-        if is_jp or is_kr or is_tw:
-            market_label = "JP" if is_jp else "KR" if is_kr else "TW"
+        is_au = is_suffix_market_symbol(stock_code, "au")
+        if is_jp or is_kr or is_tw or is_au:
+            market_label = "AU" if is_au else "JP" if is_jp else "KR" if is_kr else "TW"
             quote = self._try_fetcher_quote(stock_code, "YfinanceFetcher", **target_kwargs)
             if quote is not None:
                 logger.info(f"[realtime quote] {market_label} {stock_code} fetched (source: YfinanceFetcher)")
@@ -2586,11 +2608,60 @@ class DataFetcherManager:
         if is_us or is_hk:
             prefer_lb = self._longbridge_preferred() and not is_us_index
             if is_us:
-                primary_src = "LongbridgeFetcher" if prefer_lb else "YfinanceFetcher"
+                # 美股实时候选链同样由“数值优先级”决定，规则与日 K 一致：
+                #   - Longbridge preferred 时 Longbridge 锚定首位(pin_first)
+                #   - 其余成员(另一条 YFinance/Longbridge 主链源，以及仅在已配置
+                #     OpenD 时参与的 Futu)按各源当前 priority 排序
+                # 因此 FUTU_PRIORITY 对日 K 与实时行情同样生效：把它调大后 Futu
+                # 不会抢在 YFinance/Longbridge 之前成为美股实时主源。
+                anchor_src = "LongbridgeFetcher" if prefer_lb else "YfinanceFetcher"
+                us_candidates = self._us_realtime_source_order(
+                    prefer_lb=prefer_lb, is_us_index=is_us_index
+                )
                 secondary_src = "YfinanceFetcher" if prefer_lb else "LongbridgeFetcher"
-                market_label = "US index" if is_us_index else "US"
-                primary_kw: dict = {}
                 secondary_kw: dict = {}
+                market_label = "US index" if is_us_index else "US"
+
+                primary_quote = None
+                fallback_from = None
+                for src_name in us_candidates:
+                    candidate = self._try_fetcher_quote(
+                        stock_code, src_name, **target_kwargs
+                    )
+                    if candidate is not None and src_name == "FutuFetcher":
+                        # Futu 快照可能过期：过期即丢弃并继续下一源，
+                        # 避免过期快照压住更新的报价。
+                        probe = self._enrich_realtime_quote(
+                            candidate,
+                            realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
+                        )
+                        if getattr(probe, "is_stale", False):
+                            logger.info(
+                                "[realtime quote] US %s futu snapshot stale (%ss), falling back",
+                                stock_code,
+                                getattr(probe, "stale_seconds", None),
+                            )
+                            candidate = None
+                    if candidate is None:
+                        if fallback_from is None:
+                            fallback_from = self._realtime_fetcher_token(src_name)
+                        logger.info(
+                            "[realtime quote] %s %s source %s unusable, falling back",
+                            market_label,
+                            stock_code,
+                            src_name,
+                        )
+                        continue
+                    primary_quote = candidate
+                    logger.info(
+                        "[realtime quote] %s %s fetched (source: %s)",
+                        market_label,
+                        stock_code,
+                        src_name,
+                    )
+                    break
+                if primary_quote is None and fallback_from is None:
+                    fallback_from = self._realtime_fetcher_token(anchor_src)
             else:
                 hk_priority = [
                     source.strip().lower()
@@ -2663,11 +2734,6 @@ class DataFetcherManager:
                 if log_final_failure:
                     logger.info("[realtime quote] HK %s no available data source", stock_code)
                 return None
-            primary_token = self._realtime_fetcher_token(primary_src, **primary_kw)
-            primary_quote = self._try_fetcher_quote(stock_code, primary_src, **primary_kw, **target_kwargs)
-            fallback_from = primary_token if primary_quote is None else None
-            if primary_quote is not None:
-                logger.info(f"[realtime quote] {market_label} {stock_code} fetched (source: {primary_src})")
             # US index quotes are YFinance-only. Longbridge accepts index-like
             # symbols syntactically, but does not provide the index quote
             # contract used by this manager, so it must not be used as either
@@ -2772,6 +2838,19 @@ class DataFetcherManager:
                             operation="get_realtime_quote",
                         )
                         quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+
+                elif source == "futu":
+                    fetcher = self._get_fetcher_by_name("FutuFetcher", capability="realtime_quote")
+                    if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
+                        record_provider_run_started(
+                            data_type="realtime_quote",
+                            provider=fetcher.name,
+                            operation="get_realtime_quote",
+                        )
+                        # Pass the normalized code (bare 6 digits) so a request for
+                        # SH600519 / 600519.SS hits the same Futu symbol as 600519,
+                        # matching the daily-K path.
+                        quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code)
 
                 provider_name = fetcher.name if fetcher is not None else source
                 if analysis_target is not None and quote is not None and not self._quote_matches_target(quote, analysis_target):
@@ -2920,6 +2999,25 @@ class DataFetcherManager:
             return [pinned] + sorted(rest, key=lambda name: priority_by_name.get(name, 10 ** 9))
         return sorted(source_order, key=lambda name: priority_by_name.get(name, 10 ** 9))
 
+    def _us_realtime_source_order(self, *, prefer_lb: bool, is_us_index: bool) -> List[str]:
+        """美股实时行情候选顺序，与日 K 共用同一套数值优先级规则。
+
+        - Longbridge preferred（且非指数）时 Longbridge 锚定首位；
+        - 其余成员（另一条 YFinance/Longbridge 主链源，以及仅在已配置 OpenD
+          时参与的 Futu）按各 fetcher.priority 稳定排序；
+        - 美股指数只走 YFinance，不引入其它源。
+        """
+        anchor_src = "LongbridgeFetcher" if prefer_lb else "YfinanceFetcher"
+        order = [anchor_src]
+        if not is_us_index:
+            order.append("YfinanceFetcher" if prefer_lb else "LongbridgeFetcher")
+            if self._futu_realtime_enabled():
+                order.append("FutuFetcher")
+        # 与美股日 K 相同：只有 Longbridge preferred 的锚定首位不受普通
+        # priority 覆盖；其余情况全部按当前数值优先级排序，FUTU_PRIORITY
+        # 因此对实时行情同样生效。
+        return self._order_us_sources_by_priority(order, pin_first=bool(prefer_lb))
+
     def _longbridge_preferred(self, capability: str = "realtime_quote") -> bool:
         """Return True when Longbridge keys are configured and available.
 
@@ -3053,6 +3151,11 @@ class DataFetcherManager:
         """
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+
+        # Current chip-distribution providers are CN-only. Never submit an
+        # Australian symbol to a provider that may strip or misread its suffix.
+        if is_suffix_market_symbol(stock_code, "au"):
+            return None
 
         from .realtime_types import get_chip_circuit_breaker
         from src.config import get_config
@@ -3214,7 +3317,7 @@ class DataFetcherManager:
         # 3. 依次尝试各个数据源
         upper_code = stock_code.strip().upper()
         market = "us" if upper_code.endswith(_US_EXCHANGE_SUFFIXES) else _market_tag(upper_code)
-        _US_CAPABLE_FETCHERS = {"YfinanceFetcher", "LongbridgeFetcher", "FinnhubFetcher", "AlphaVantageFetcher"}
+        _US_CAPABLE_FETCHERS = {"YfinanceFetcher", "LongbridgeFetcher", "FutuFetcher", "FinnhubFetcher", "AlphaVantageFetcher"}
         for fetcher in self._get_fetchers_snapshot():
             if not hasattr(fetcher, 'get_stock_name'):
                 continue
@@ -3223,7 +3326,10 @@ class DataFetcherManager:
                     continue
             elif market != "cn":
                 supported_markets = self._DAILY_MARKET_FETCHER_SUPPORT.get(fetcher.name)
-                if supported_markets is not None and market not in supported_markets:
+                # ASX names come only from fetchers that declare AU support.
+                if (market == "au" and supported_markets is None) or (
+                    supported_markets is not None and market not in supported_markets
+                ):
                     continue
             if not self._is_fetcher_available(fetcher, capability="stock_name"):
                 continue
@@ -3439,6 +3545,8 @@ class DataFetcherManager:
                     logger.warning(f"[TickFlowFetcher] failed to fetch index quotes: {e}")
 
         for fetcher in self._fetchers:
+            if region == "au" and fetcher.name != "YfinanceFetcher":
+                continue
             if region == "cn" and fetcher.name == "TickFlowFetcher":
                 continue
             try:
@@ -4445,7 +4553,7 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
         is_etf = _is_etf_code(stock_code)
-        if market in {"us", "hk", "jp", "kr", "tw"}:
+        if market in {"us", "hk", "jp", "kr", "tw", "au"}:
             return self._build_offshore_fundamental_context(
                 stock_code,
                 market=market,
